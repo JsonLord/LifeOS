@@ -29,11 +29,21 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { emitPolicy, SHELL_DENY_GLOBS } from "./Policy.ts";
-import { daName, skillIndex } from "./RenderSoul.ts";
+import { daName, renderSkillRouting, skillIndex } from "./RenderSoul.ts";
 import { INSTALL_ROOT, renderSoul, scrubPaths } from "./RenderSoul.ts";
+import { renderCoachConstitution } from "./RenderSoul.ts";
+import { createLifeOSStore } from "../STORAGE/StoreFactory.ts";
+import { resolveStorageConfig } from "../STORAGE/StorageConfig.ts";
 
 const HOME = homedir();
-const HERMES_HOME = process.env.HERMES_HOME || join(HOME, ".hermes");
+const HERMES_BASE_HOME = process.env.HERMES_HOME || join(HOME, ".hermes");
+export function resolveHermesProfileHome(base: string, profile?: string): string {
+  return profile ? join(base, "profiles", profile) : base;
+}
+function argValue(name: string): string | undefined { const at = process.argv.indexOf(name); return at >= 0 ? process.argv[at + 1] : undefined; }
+const PROFILE = argValue("--profile");
+const STORAGE_PROVIDER = argValue("--storage-provider") ?? process.env.LIFEOS_STORAGE_PROVIDER;
+const HERMES_HOME = resolveHermesProfileHome(HERMES_BASE_HOME, PROFILE);
 const WORKSPACE = process.env.HERMES_WORKSPACE || join(HOME, "HermesWorkspace");
 const PLUGIN_SRC = join(import.meta.dir, "plugin");
 const PLUGIN_DEST = join(HERMES_HOME, "plugins", "lifeos");
@@ -212,7 +222,18 @@ function ensurePluginEnabled(yaml: string): { yaml: string; changed: boolean } {
   return { yaml: next, changed: true };
 }
 
-function main(): void {
+/** Disable only competing personal-profile memory; operational Hermes state remains enabled. */
+export function ensureCoachMemoryDisabled(yaml: string): { yaml: string; changed: boolean } {
+  const lines = yaml.split("\n"); const start = lines.findIndex((line) => /^memory:\s*$/.test(line));
+  if (start < 0) return { yaml: `${yaml.replace(/\n*$/, "")}\nmemory:\n  memory_enabled: false\n  user_profile_enabled: false\n`, changed: true };
+  let end = start + 1; while (end < lines.length && (lines[end]!.trim() === "" || /^\s/.test(lines[end]!))) end++;
+  const block = lines.slice(start + 1, end).filter((line) => !/^\s+(memory_enabled|user_profile_enabled):/.test(line));
+  block.push("  memory_enabled: false", "  user_profile_enabled: false");
+  const next = [...lines.slice(0, start + 1), ...block, ...lines.slice(end)].join("\n");
+  return { yaml: next, changed: next !== yaml };
+}
+
+export async function main(): Promise<void> {
   const args = new Set(process.argv.slice(2));
   const check = args.has("--check");
   const keepOutputFormat = args.has("--keep-output-format");
@@ -221,7 +242,11 @@ function main(): void {
     throw new Error(`no Hermes install at ${scrubPaths(HERMES_HOME)} — install Hermes first`);
   }
 
-  const soul = renderSoul({ keepOutputFormat });
+  const storage = resolveStorageConfig({ provider: STORAGE_PROVIDER });
+  const store = createLifeOSStore(storage);
+  const health = await store.healthCheck();
+  if (!health.ok) throw new Error(`storage health check failed: ${health.message}`);
+  const soul = storage.provider === "notion" ? renderCoachConstitution() + "\n\n" + renderSkillRouting() + "\n" : renderSoul({ keepOutputFormat });
   const soulPath = join(HERMES_HOME, "SOUL.md");
   const soulCurrent = existsSync(soulPath) ? readFileSync(soulPath, "utf8") : "";
   const soulDrifted = soulCurrent !== soul;
@@ -242,12 +267,14 @@ function main(): void {
   ({ yaml } = setSkillsExternalDirs(yaml, [join(INSTALL_ROOT, "skills")]));
   ({ yaml } = ensureApprovals(yaml));
   ({ yaml } = ensurePluginEnabled(yaml));
+  if (storage.provider === "notion") ({ yaml } = ensureCoachMemoryDisabled(yaml));
   const configDrifted = yaml !== yamlBefore;
 
   if (check) {
     console.log(`soul       ${soul.length} chars, digest ${digest}`);
     console.log(`           ${soulDrifted ? "STALE — re-run Mount.ts" : "current"}`);
     console.log(`config     ${configDrifted ? "STALE — re-run Mount.ts" : "current"}`);
+    console.log(`storage    ${health.provider}: ${health.message}`);
     process.exit(soulDrifted || configDrifted ? 1 : 0);
   }
 
@@ -272,8 +299,9 @@ function main(): void {
   console.log(`✓ SOUL.md            ${soul.length} chars (cap ${CONTEXT_FILE_MAX_CHARS}), digest ${digest}`);
   console.log(`✓ skills mounted     ${scrubPaths(join(INSTALL_ROOT, "skills"))} (${skillIndex().length} indexed in soul — the default routing path)`);
   console.log(`✓ config.yaml        ${configDrifted ? "patched" : "already current"}`);
+  console.log(`✓ storage            ${health.provider}: ${health.message}`);
   for (const c of pluginChanges) console.log(`✓ ${c.what.padEnd(18)} ${c.detail}`);
   if (!pluginChanges.length) console.log("✓ plugin             already current");
 }
 
-main();
+if (import.meta.main) await main();
