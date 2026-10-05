@@ -18,6 +18,10 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { canonicalInputHashes } from "../STORAGE/CanonicalState.ts";
+import { createLifeOSStore } from "../STORAGE/StoreFactory.ts";
+import { resolveStorageConfig } from "../STORAGE/StorageConfig.ts";
+import type { LifeOSStore } from "../STORAGE/types.ts";
 
 type SpawnReadable = ReadableStream<Uint8Array> | null;
 type SpawnProcess = {
@@ -169,6 +173,10 @@ function currentHashes(paths: string[]): Record<string, string> {
     hashes[path] = sha256(path);
   }
   return hashes;
+}
+
+export async function getDerivedCanonicalHashes(store: LifeOSStore): Promise<Record<string, string>> {
+  return canonicalInputHashes(store);
 }
 
 function readState(): StateFile | null {
@@ -383,10 +391,11 @@ function printStatus(): void {
   }
 }
 
-async function runSync(dryRun: boolean, force: boolean): Promise<number> {
+async function runSync(dryRun: boolean, force: boolean, store = createLifeOSStore(resolveStorageConfig())): Promise<number> {
   const state = readState();
-  const watched = watchedSourceFiles();
-  const hashes = currentHashes(watched);
+  const providerHashes = store.provider === "filesystem" ? null : await getDerivedCanonicalHashes(store);
+  const watched = providerHashes ? Object.keys(providerHashes).sort() : watchedSourceFiles();
+  const hashes = providerHashes ?? currentHashes(watched);
   const changed = changedFiles(state, hashes, force);
   const actions = plannedActions(changed);
 
@@ -484,4 +493,4 @@ async function main(): Promise<void> {
   process.exit(exitCode);
 }
 
-main();
+if (import.meta.main) await main();

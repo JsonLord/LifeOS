@@ -15,7 +15,7 @@ const COMMANDS = new Set(["status", "search", "timeline", "get", "export", "reme
 
 export interface CortexEnvelope { schema: typeof SCHEMA; ok: boolean; command: string; data: unknown; error: null | { code: string; message: string } }
 export interface CortexRunResult { exitCode: number; envelope: CortexEnvelope }
-export interface CortexRuntime { memoryRoot?: string; memoryAdd?: (item: any) => any }
+export interface CortexRuntime { memoryRoot?: string; memoryAdd?: (item: any) => any | Promise<any>; store?: import("../STORAGE/types.ts").LifeOSStore }
 export interface CortexRecord { id: string; type: string; title: string; created: string; updated: string; provenance: { source: string; session: string | null; path: string }; content: string; related: string[]; valid_from?: string | null; valid_until?: string | null }
 export interface CortexCard { id: string; type: string; created: string; updated: string; provenance: CortexRecord["provenance"]; score: number; est_tokens: number }
 
@@ -200,6 +200,17 @@ export function enumerateCanonicalCorpus(root: string): { root: string; files: s
   return { root: canonicalRoot, files, records };
 }
 export function loadCanonicalRecords(root: string): CortexRecord[] { return enumerateCanonicalCorpus(root).records; }
+export async function loadStoreCanonicalRecords(store: import("../STORAGE/types.ts").LifeOSStore): Promise<CortexRecord[]> {
+  const records: CortexRecord[] = [];
+  for (const key of ["knowledge", "ideas", "journal"] as const) {
+    const values = await store.queryCollection(key, { limit: 100, hydrateContent: true });
+    for (const value of values) {
+      const properties = value.properties as Record<string, any>; const created = String(properties.created ?? properties.date ?? value.updatedAt ?? new Date(0).toISOString());
+      records.push(validateRecord({ id: value.id, type: String(properties.type ?? key.replace(/s$/, "")), title: value.title ?? value.id, created, updated: value.updatedAt ?? created, provenance: { source: `store:${key}`, session: properties.source_session ?? null, path: `${key}/${value.id}` }, content: sanitizeContent(value.content ?? "", properties), related: Array.isArray(properties.related) ? properties.related.map(String) : [], valid_from: properties.valid_from ?? null, valid_until: properties.valid_until ?? null }));
+    }
+  }
+  return records;
+}
 
 type Parsed = { command: string; options: Map<string, string | true>; positionals: string[] };
 const VALUE_OPTIONS = new Set(["--memory-root", "--adapter", "--type", "--source", "--session", "--from", "--to", "--page", "--page-size", "--recency", "--expand", "--max-nodes", "--max-tokens", "--anchor", "--before", "--after"]);
@@ -271,7 +282,12 @@ export async function runCortex(args: string[], runtime: CortexRuntime = {}): Pr
     let item:any;try{item=JSON.parse(raw);}catch{return fail(command,EXIT.INVALID_INPUT,"invalid_input","Write payload must be valid JSON");}
     const durableTypes = new Set(["memory", "idea", "knowledge"]);
     if ((command === "propose" && item?.type !== "proposal") || (command === "remember" && !durableTypes.has(item?.type))) return fail(command, EXIT.WRITE_REFUSED, "write_refused", `${command} payload type is not authorized for this command`);
-    const memoryAdd=runtime.memoryAdd??(await import("./MemorySystem")).add; const result=memoryAdd(item);
+    const memoryModule = await import("./MemorySystem");
+    const result = runtime.memoryAdd
+      ? await runtime.memoryAdd(item)
+      : command === "propose"
+        ? memoryModule.add(item)
+        : await memoryModule.addCanonical(item, runtime.store ?? (await import("../STORAGE/StoreFactory.ts")).createLifeOSStore());
     if(!result?.ok)return fail(command,EXIT.WRITE_REFUSED,"governance_refused",String(result?.message??result?.code??"MemorySystem refused write"));
     return ok(command,{adapter,result});
   }
@@ -281,7 +297,7 @@ export async function runCortex(args: string[], runtime: CortexRuntime = {}): Pr
   if(command==="timeline"&&parsed.positionals.length) return fail(command,EXIT.INVALID_INPUT,"invalid_input","timeline accepts no positional arguments");
   if((command==="get"||command==="export")&&(parsed.positionals.length===0||parsed.positionals.length>LIMITS.IDS)) return fail(command,EXIT.INVALID_INPUT,"invalid_input",`${command} requires one or more explicit IDs (maximum ${LIMITS.IDS})`);
   const requestedRoot=resolve(runtime.memoryRoot??opt(parsed,"--memory-root")??process.env.CORTEX_MEMORY_ROOT??join(homedir(),".claude/LIFEOS/MEMORY"));
-  let memoryRoot=requestedRoot, records:CortexRecord[];try{const corpus=enumerateCanonicalCorpus(requestedRoot);memoryRoot=corpus.root;records=corpus.records;}catch(error){if(error instanceof IntegrityError)return fail(command,EXIT.INVALID_INPUT,"integrity_error",error.message);return fail(command,EXIT.INTERNAL,"internal_error",error instanceof Error?error.message:String(error));}
+  let memoryRoot=requestedRoot, records:CortexRecord[];try{const store = runtime.store ?? (await import("../STORAGE/StoreFactory.ts")).createLifeOSStore(); if (store.provider === "notion") { memoryRoot = "provider:notion"; records = await loadStoreCanonicalRecords(store); } else { const corpus=enumerateCanonicalCorpus(requestedRoot);memoryRoot=corpus.root;records=corpus.records; }}catch(error){if(error instanceof IntegrityError)return fail(command,EXIT.INVALID_INPUT,"integrity_error",error.message);return fail(command,EXIT.INTERNAL,"internal_error",error instanceof Error?error.message:String(error));}
   if(command==="status")return ok(command,{canonical:{root:memoryRoot,records:records.length},mode:"local-read-only",indexes:[]});
   if(command==="rebuild"){const canonical=canonicalCorpusDigest(records);const rebuilt=canonicalCorpusDigest(JSON.parse(JSON.stringify(records)));return ok(command,{format:"lifeos-cortex-canonical-rebuild/v1",canonical_digest:canonical,rebuilt_digest:rebuilt,equivalent:canonical===rebuilt,records:records.length,indexes:[]});}
   const validRecords=activeCortexRecords(records);

@@ -1,0 +1,20 @@
+[storage]
+provider = "filesystem" # change to "notion" explicitly
+
+[notion]
+root_page_id = "${NOTION_LIFEOS_ROOT_PAGE_ID}"
+
+# Collection values are integration-owned data source IDs, never database IDs
+# or secrets. Document values are page IDs.
+[notion.documents]
+principal_identity = "${NOTION_DOCUMENT_PRINCIPAL_IDENTITY_ID}"
+principal_memory = "${NOTION_DOCUMENT_PRINCIPAL_MEMORY_ID}"
+da_memory = "${NOTION_DOCUMENT_DA_MEMORY_ID}"
+principal_telos = "${NOTION_DOCUMENT_PRINCIPAL_TELOS_ID}"
+mission = "${NOTION_DOCUMENT_MISSION_ID}"
+
+[notion.collections]
+goals = "${NOTION_COLLECTION_GOALS_ID}"
+projects = "${NOTION_COLLECTION_PROJECTS_ID}"
+current_state = "${NOTION_COLLECTION_CURRENT_STATE_ID}"
+journal = "${NOTION_COLLECTION_JOURNAL_ID}"

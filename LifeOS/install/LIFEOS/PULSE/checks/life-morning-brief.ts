@@ -12,6 +12,9 @@
 import { join } from "path"
 import { existsSync, readFileSync } from "fs"
 import { homedir } from "node:os";
+import { resolveStorageConfig } from "../../STORAGE/StorageConfig.ts";
+import { createLifeOSStore } from "../../STORAGE/StoreFactory.ts";
+import type { LifeOSStore } from "../../STORAGE/types.ts";
 
 const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir()
 const TELOS_DIR = join(HOME, ".claude", "LIFEOS", "USER", "TELOS")
@@ -69,14 +72,29 @@ function getNextMove(content: string): string | null {
   return first.trim().replace(/^\d+\.\s*/, "")
 }
 
-const goals = readGoals()
-const sparks = readFile("SPARKS.md")
-const current = readFile("CURRENT.md")
-
-if (!goals && !sparks && !current) {
-  console.log("NO_ACTION")
-  process.exit(0)
+// PROVIDER_NEUTRAL_BEGIN
+export async function buildProviderMorningBrief(store: LifeOSStore): Promise<string> {
+  const [telos, goals, current, projects, knowledge, ideas] = await Promise.all([
+    store.getDocument("principal_telos"), store.queryCollection("goals", { limit: 3, hydrateContent: true }), store.queryCollection("current_state", { limit: 5, hydrateContent: true }), store.queryCollection("projects", { limit: 3, hydrateContent: true }), store.queryCollection("knowledge", { limit: 3, hydrateContent: true }), store.queryCollection("ideas", { limit: 3, hydrateContent: true }),
+  ])
+  if (!telos && !goals.length && !current.length && !projects.length && !knowledge.length && !ideas.length) return "NO_ACTION"
+  const label = (record: { title?: string; content?: string }) => record.title ?? record.content?.split("\n").find((line) => line.trim())?.replace(/^[-*#\s]+/, "").trim() ?? ""
+  const parts = ["Good morning."]
+  const goalNames = goals.map(label).filter(Boolean).slice(0, 3); if (goalNames.length) parts.push(`Your top goals: ${goalNames.map((goal, index) => `${index + 1}, ${goal}`).join(". ")}.`)
+  const next = current.map((record) => getNextMove(record.content ?? "") ?? label(record)).find(Boolean); if (next) parts.push(`Next obvious move: ${next}.`)
+  const project = projects.map(label).find(Boolean); if (project) parts.push(`Active project to align: ${project}.`)
+  const signal = [...ideas, ...knowledge].map(label).find(Boolean); if (signal) parts.push(`One relevant signal to consider: ${signal}.`)
+  if (telos?.content && !goalNames.length) parts.push("Review your current priorities against TELOS.")
+  return parts.join(" ")
 }
+// PROVIDER_NEUTRAL_END
+
+export function buildFilesystemMorningBrief(): string {
+  const goals = readGoals()
+  const sparks = readFile("SPARKS.md")
+  const current = readFile("CURRENT.md")
+
+  if (!goals && !sparks && !current) return "NO_ACTION"
 
 const topGoals = getTopGoals(goals)
 const spark = getRandomSpark(sparks)
@@ -96,4 +114,9 @@ if (nextMove) {
   parts.push(`Next obvious move: ${nextMove}.`)
 }
 
-console.log(parts.join(" "))
+  return parts.join(" ")
+}
+
+if (import.meta.main) {
+  const storage = resolveStorageConfig(); const output = storage.provider === "filesystem" ? buildFilesystemMorningBrief() : await buildProviderMorningBrief(createLifeOSStore(storage)); console.log(output)
+}
