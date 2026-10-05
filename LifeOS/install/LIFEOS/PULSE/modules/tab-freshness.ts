@@ -29,6 +29,9 @@
 import { existsSync, statSync, readdirSync, readFileSync } from "fs"
 import { join } from "path"
 import { homedir } from "node:os";
+import { resolveStorageConfig } from "../../STORAGE/StorageConfig.ts";
+import { createLifeOSStore } from "../../STORAGE/StoreFactory.ts";
+import type { LifeOSCollectionKey, LifeOSDocumentKey, LifeOSStore } from "../../STORAGE/types.ts";
 
 const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir()
 const LIFEOS_DIR = join(HOME, ".claude", "LIFEOS")
@@ -295,6 +298,30 @@ function computeTabFreshness(tabId: string): FreshnessPayload {
   }
 }
 
+const PROVIDER_TABS: Partial<Record<string, Array<{ type: "document"; key: LifeOSDocumentKey } | { type: "collection"; key: LifeOSCollectionKey }>>> = {
+  telos: [{ type: "document", key: "principal_telos" }, { type: "collection", key: "goals" }, { type: "collection", key: "current_state" }],
+  work: [{ type: "collection", key: "projects" }], local: [{ type: "document", key: "principal_identity" }],
+  knowledge: [{ type: "collection", key: "knowledge" }], synapse: [{ type: "collection", key: "ideas" }],
+  assistant: [{ type: "document", key: "da_identity" }, { type: "document", key: "principal_identity" }],
+}
+const OPERATIONAL_TABS = new Set(["hooks", "skills", "agents", "docs", "performance", "ledger", "atlas"])
+
+// PROVIDER_NEUTRAL_BEGIN
+export async function computeProviderTabFreshness(tabId: string, store: LifeOSStore): Promise<FreshnessPayload> {
+  const specs = PROVIDER_TABS[tabId]
+  if (!specs) return OPERATIONAL_TABS.has(tabId) ? computeTabFreshness(tabId) : { tabId, dataDate: null, label: "no provider-neutral canonical revision registered", daysOld: null, tier: "unknown", perFile: [] }
+  const perFile: FreshnessFilePayload[] = []; let mostRecent: Date | null = null
+  for (const spec of specs) {
+    const revision = spec.type === "document" ? await store.getDocumentRevision(spec.key) : await store.getCollectionRevision(spec.key)
+    const date = revision?.updatedAt ? new Date(revision.updatedAt) : null
+    perFile.push({ name: `${spec.type}:${spec.key}`, date: date ? isoDate(date) : null, source: revision ? "state" : "unknown" })
+    if (date && (!mostRecent || date > mostRecent)) mostRecent = date
+  }
+  const daysOld = mostRecent ? Math.floor((Date.now() - mostRecent.getTime()) / 86_400_000) : null
+  return { tabId, dataDate: mostRecent ? isoDate(mostRecent) : null, label: `${perFile.filter((item) => item.date).length} of ${perFile.length} logical sources dated`, daysOld, tier: tierFromDays(daysOld), perFile }
+}
+// PROVIDER_NEUTRAL_END
+
 // ── Lifecycle ──
 
 export async function start(): Promise<void> {
@@ -349,7 +376,7 @@ export async function handleRequest(req: Request, pathname: string): Promise<Res
   if (cached && now < cached.expiresAt) {
     return Response.json(cached.payload)
   }
-  const payload = computeTabFreshness(tabId)
+  const storage = resolveStorageConfig(); const payload = storage.provider === "filesystem" ? computeTabFreshness(tabId) : await computeProviderTabFreshness(tabId, createLifeOSStore(storage))
   state.cache.set(tabId, { payload, expiresAt: now + CACHE_TTL_MS })
   return Response.json(payload)
 }

@@ -29,6 +29,10 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 import { readFileSync, writeFileSync, statSync, readdirSync, mkdirSync, existsSync, watch } from "fs"
 import { join, relative, basename, dirname } from "path"
 import { homedir } from "node:os";
+import { createLifeOSStore } from "../../STORAGE/StoreFactory.ts"
+import { resolveStorageConfig } from "../../STORAGE/StorageConfig.ts"
+import { CANONICAL_DERIVED_INPUTS } from "../../STORAGE/CanonicalState.ts"
+import type { LifeOSStore } from "../../STORAGE/types.ts"
 
 // Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
 for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
@@ -516,6 +520,16 @@ function buildIndex(): UserIndex {
   }
 }
 
+export async function buildProviderIndex(store: LifeOSStore): Promise<UserIndex> {
+  const files: UserIndexEntry[] = []
+  const add = (path: string, title: string, content: string, lastUpdated?: string) => files.push({ path, absolute_path: `store:${path}`, title, category: path.includes("identity") || path.includes("memory") ? "identity" : "domain", kind: "reference", publish: "false", review_cadence_days: 0, interview_phase: null, last_updated: lastUpdated ?? new Date(0).toISOString(), last_updated_source: "frontmatter", staleness_days: 0, overdue_review: false, completeness: content.trim() ? 100 : 0, has_tbd: /\bTBD\b/i.test(content), preview: content.split("\n").filter(Boolean).slice(0, 3).join("\n"), item_count: null, items: null, word_count: content.trim() ? content.trim().split(/\s+/).length : 0, size_bytes: Buffer.byteLength(content), inferred: false, frontmatter_raw: {} })
+  for (const key of CANONICAL_DERIVED_INPUTS.documents) { const document = await store.getDocument(key); if (document) add(`documents/${key}`, document.title ?? key, document.content, document.updatedAt) }
+  for (const key of CANONICAL_DERIVED_INPUTS.collections) for (const record of await store.queryCollection(key, { limit: 25, hydrateContent: true })) add(`collections/${key}/${record.id}`, record.title ?? record.id, record.content ?? "", record.updatedAt)
+  const by_category = { identity: [], voice: [], mind: [], taste: [], shape: [], ops: [], domain: [], unknown: [] } as Record<Category, UserIndexEntry[]>
+  for (const file of files) by_category[file.category].push(file)
+  return { version: "1.0.0", generated_at: new Date().toISOString(), user_dir: `provider:${store.provider}`, files, by_category, domains: [], publish_feed: [], stale_queue: [], interview_gaps: [], stats: { total_files: files.length, total_size_bytes: files.reduce((sum, file) => sum + file.size_bytes, 0), avg_completeness: files.length ? Math.round(files.reduce((sum, file) => sum + file.completeness, 0) / files.length) : 0, by_kind: { collection: 0, narrative: 0, reference: files.length, index: 0, metric: 0, unknown: 0 }, by_publish: { "false": files.length, "daemon-summary": 0, daemon: 0, public: 0 }, frontmatter_coverage: 100 } }
+}
+
 function writeIndex(index: UserIndex): void {
   if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true })
   writeFileSync(INDEX_PATH, JSON.stringify(index, null, 2))
@@ -560,12 +574,14 @@ export async function start(): Promise<void> {
   state.running = true
   state.startedAt = new Date()
 
-  // Initial full scan
-  const index = buildIndex()
+  // Initial index. Notion mode never requires or watches a local USER mirror.
+  const storage = resolveStorageConfig()
+  const index = storage.provider === "notion" ? await buildProviderIndex(createLifeOSStore(storage)) : buildIndex()
   writeIndex(index)
   state.lastIndexed = new Date()
   console.log(`[${MODULE_NAME}] Initial scan: ${index.files.length} files, ${index.stats.frontmatter_coverage}% frontmatter coverage`)
 
+  if (storage.provider === "notion") return
   // Watch for changes
   try {
     state.watcher = watch(USER_DIR, { recursive: true }, (event, filename) => {

@@ -36,6 +36,9 @@ import YAML from "yaml"
 import { PULSE_BASE } from "../endpoint"
 import { RUN_ACTIVITY } from "../../TOOLS/ascent"
 import { loadLifeosConfig } from "../../TOOLS/LifeosConfig"
+import { resolveStorageConfig } from "../../STORAGE/StorageConfig.ts"
+import { createLifeOSStore } from "../../STORAGE/StoreFactory.ts"
+import type { LifeOSStore } from "../../STORAGE/types.ts"
 
 // Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
 for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
@@ -4520,6 +4523,37 @@ function handleOnboardingState(): Response {
   })
 }
 
+/** Provider-backed canonical dashboard subset; operational routes still use local state. */
+// PROVIDER_NEUTRAL_BEGIN
+export async function handleProviderCanonicalRequest(req: Request, pathname: string, store: LifeOSStore): Promise<Response | null> {
+  const canonicalMutation = pathname === "/api/telos/file" || pathname.startsWith("/api/knowledge/")
+  if ((req.method === "PUT" || req.method === "POST") && canonicalMutation) return Response.json({ error: "provider-managed canonical state", detail: "Use the trusted LifeOS mutation and approval commands." }, { status: 409 })
+  if (req.method !== "GET") return null
+  const preview = (content = "") => content.replace(/---[\s\S]*?---/, "").trim().slice(0, 500)
+  if (pathname === "/api/life/home") {
+    const [goals, current, ideas] = await Promise.all([store.queryCollection("goals", { limit: 3, hydrateContent: true }), store.queryCollection("current_state", { limit: 5, hydrateContent: true }), store.queryCollection("ideas", { limit: 1, hydrateContent: true })])
+    return Response.json({ oneSentence: null, updated: null, updatedBy: null, domains: current.map((record) => ({ name: record.title ?? "current_state", summary: preview(record.content), body: preview(record.content) })), current: {}, topGoals: goals.map((record) => ({ title: record.title ?? preview(record.content) })), nextActions: [], spark: ideas[0]?.title ?? preview(ideas[0]?.content), sparkCount: ideas.length, timelineBlockCount: 0, topIntent: null, source: "LifeOSStore" })
+  }
+  if (pathname === "/api/life/work") {
+    const [projects, current] = await Promise.all([store.queryCollection("projects", { limit: 20, hydrateContent: false }), store.queryCollection("current_state", { limit: 5, hydrateContent: true })])
+    return Response.json({ projects: projects.map((record) => ({ name: record.title ?? "project", path: "", url: "" })), currentFocus: preview(current[0]?.content), currentProject: "", activeWorkstreams: "", algorithmSessions: [], source: "collection:projects" })
+  }
+  if (pathname === "/api/life/goals" || pathname === "/api/telos/overview") {
+    const [telos, mission, beliefs, strategies, goals, current] = await Promise.all([store.getDocument("principal_telos"), store.getDocument("mission"), store.getDocument("beliefs"), store.getDocument("strategies"), store.queryCollection("goals", { limit: 25, hydrateContent: true }), store.queryCollection("current_state", { limit: 10, hydrateContent: true })])
+    return Response.json({ source: "LifeOSStore", telos: preview(telos?.content), mission: preview(mission?.content), beliefs: preview(beliefs?.content), strategies: preview(strategies?.content), goals: goals.map((record) => ({ title: record.title ?? preview(record.content), preview: preview(record.content) })), currentState: current.map((record) => ({ title: record.title ?? "current_state", preview: preview(record.content) })) })
+  }
+  if (pathname === "/api/onboarding/state") {
+    const [identity, telos] = await Promise.all([store.getDocument("da_identity"), store.getDocument("principal_telos")]); const name = identity?.content.match(/\*\*Name:\*\*\s*([^\n|*]+)/i)?.[1]?.trim() || "your DA"
+    return Response.json({ templateMode: !Boolean(telos?.content.trim()), daName: name, interviewCommand: "/interview", source: "LifeOSStore" })
+  }
+  if (pathname === "/api/knowledge" || pathname === "/api/memory/graph") {
+    const records = await store.queryCollection("knowledge", { limit: 25, hydrateContent: false }); return Response.json({ source: "LifeOSStore", count: records.length, items: records.map((record) => ({ name: record.title ?? "knowledge", updatedAt: record.updatedAt ?? null })) })
+  }
+  if (pathname === "/api/telos/file" || pathname.startsWith("/api/knowledge/")) return Response.json({ error: "provider-managed logical resource; arbitrary file access is unavailable" }, { status: 409 })
+  return null
+}
+// PROVIDER_NEUTRAL_END
+
 // ════════════════════════════════════════
 // Request Router
 // ════════════════════════════════════════
@@ -4530,6 +4564,8 @@ export async function handleObservabilityRequest(req: Request): Promise<Response
   const url = new URL(req.url)
   const pathname = url.pathname
   const method = req.method
+  const storage = resolveStorageConfig()
+  if (storage.provider !== "filesystem") { const response = await handleProviderCanonicalRequest(req, pathname, createLifeOSStore(storage)); if (response) return response }
 
   // ── PUT routes ──
 

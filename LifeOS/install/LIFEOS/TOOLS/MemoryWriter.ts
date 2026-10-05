@@ -51,6 +51,7 @@ import {
 } from "node:fs";
 import { dirname, resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
+import type { LifeOSDocumentKey, LifeOSStore } from "../STORAGE/types.ts";
 
 // ── Constants ──
 
@@ -346,6 +347,21 @@ export function serializeMemoryContent(
   if (newEntries.length > 0) out += newEntries.join("\n") + "\n";
   out += END_MARKER + "\n";
   return out;
+}
+
+/** Canonical provider writer; lock files, snapshots, and telemetry remain local concerns. */
+export async function setStoreEntries(
+  store: LifeOSStore,
+  key: Extract<LifeOSDocumentKey, "principal_memory" | "da_memory">,
+  entries: string[],
+  updatedBy = "MemorySystem.addCanonical",
+): Promise<SetEntriesResult> {
+  const validated = validateAndDedup(entries);
+  if (validated.accepted.length > MAX_ENTRIES) return { ok: false, code: "EAT_CAP", message: `Submission has ${validated.accepted.length} entries; cap is ${MAX_ENTRIES}`, over_count: validated.accepted.length - MAX_ENTRIES, cap: MAX_ENTRIES, indexed_submission: validated.accepted };
+  const existing = await store.getDocument(key);
+  const parsed = parseMemoryContent(existing?.content ?? "");
+  await store.replaceDocument(key, serializeMemoryContent(parsed, validated.accepted, updatedBy));
+  return { ok: true, accepted: validated.accepted.length, dropped_malformed: validated.malformed, dropped_overlength: validated.overlength, dropped_duplicates: validated.duplicates, prior_count: parsed.entries.length, new_count: validated.accepted.length, evictions: parsed.entries.filter((entry) => !validated.accepted.includes(entry)), additions: validated.accepted.filter((entry) => !parsed.entries.includes(entry)) };
 }
 
 // ── Atomic write with lock ──

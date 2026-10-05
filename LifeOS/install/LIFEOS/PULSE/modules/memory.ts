@@ -31,6 +31,8 @@ import { join } from "node:path";
 import { parseMemoryContent } from "../../TOOLS/MemoryWriter";
 import { isTerminalStatus } from "../lib/memory-proposals";
 import { homedir } from "node:os";
+import { createLifeOSStore } from "../../STORAGE/StoreFactory.ts";
+import type { LifeOSStore } from "../../STORAGE/types.ts";
 
 const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
 const CLAUDE = join(HOME, ".claude");
@@ -41,8 +43,6 @@ const HEALTH_LOG = join(OBS_DIR, "memory-health.jsonl");
 const FIRES_LOG = join(OBS_DIR, "reviewer-fires.jsonl");
 const PROPOSALS_LOG = join(OBS_DIR, "pending-proposals.jsonl");
 const REVIEWER_RUNS = join(OBS_DIR, "reviewer-runs");
-const PRINCIPAL_MEMORY = join(CLAUDE, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_MEMORY.md");
-const DA_MEMORY = join(CLAUDE, "LIFEOS/USER/DIGITAL_ASSISTANT/DA_MEMORY.md");
 const CADENCE_CONFIG = join(CLAUDE, "LIFEOS/USER/CONFIG/memory-review.json");
 
 interface ModuleState {
@@ -109,18 +109,10 @@ function safeReadJsonLines(path: string, lastN: number = 50): any[] {
   }
 }
 
-function readMemoryFile(path: string): { entries: string[]; count: number; charsUsed: number } {
-  if (!existsSync(path)) return { entries: [], count: 0, charsUsed: 0 };
-  try {
-    // Shared lenient parser (MemoryWriter owns it) — the old strict indexOf slice
-    // showed an EMPTY panel on marker-corrupted files, which is how weeks of
-    // zero-memory sessions went unnoticed. (public PR #1593, @anikinsasha)
-    const { entries } = parseMemoryContent(readFileSync(path, "utf-8"));
-    const charsUsed = entries.reduce((s, e) => s + e.length, 0);
-    return { entries, count: entries.length, charsUsed };
-  } catch {
-    return { entries: [], count: 0, charsUsed: 0 };
-  }
+async function readMemoryDocument(store: LifeOSStore, key: "principal_memory" | "da_memory"): Promise<{ entries: string[]; count: number; charsUsed: number }> {
+  const document = await store.getDocument(key);
+  const entries = parseMemoryContent(document?.content ?? "").entries;
+  return { entries, count: entries.length, charsUsed: entries.reduce((sum, entry) => sum + entry.length, 0) };
 }
 
 function recentReviewerRuns(n: number = 10): Array<{
@@ -194,7 +186,7 @@ function recentReviewerRuns(n: number = 10): Array<{
   }
 }
 
-function buildSnapshot() {
+export async function buildSnapshot(store: LifeOSStore = createLifeOSStore()) {
   const reviewState = safeReadJson(REVIEW_STATE) || {
     turn_count_since_last_review: 0,
     last_review_at: null,
@@ -211,8 +203,7 @@ function buildSnapshot() {
   const health = healthRows.length > 0 ? healthRows[0] : null;
   const firesAll = safeReadJsonLines(FIRES_LOG, 200);
   const proposals = safeReadJsonLines(PROPOSALS_LOG, 50);
-  const principal = readMemoryFile(PRINCIPAL_MEMORY);
-  const da = readMemoryFile(DA_MEMORY);
+  const [principal, da] = await Promise.all([readMemoryDocument(store, "principal_memory"), readMemoryDocument(store, "da_memory")]);
   const runs = recentReviewerRuns(10);
 
   // Compute derived state
@@ -254,7 +245,7 @@ export async function handleRequest(req: Request, pathname: string): Promise<Res
   if (req.method !== "GET") return null;
 
   if (pathname === "/api/memory" || pathname === "/api/memory/") {
-    const snap = buildSnapshot();
+    const snap = await buildSnapshot();
     return new Response(JSON.stringify(snap, null, 2), {
       status: 200,
       headers: { "content-type": "application/json" },
