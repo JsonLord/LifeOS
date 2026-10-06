@@ -21,6 +21,9 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { copyMissing, detectDevTree } from "./InstallEngine";
+import { resolveStorageConfig } from "../../../LIFEOS/STORAGE/StorageConfig.ts";
+import { createLifeOSStore } from "../../../LIFEOS/STORAGE/StoreFactory.ts";
+import type { LifeOSStore, StorageConfig } from "../../../LIFEOS/STORAGE/types.ts";
 
 // Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
 for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
@@ -29,7 +32,12 @@ for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 }
 
 
-function main(): void {
+export async function validateSetupStorage(storage: StorageConfig, store: LifeOSStore): Promise<{ ok: boolean; provider: string; scaffold: boolean; health?: unknown }> {
+  if (storage.provider === "filesystem") return { ok: true, provider: "filesystem", scaffold: true };
+  const health = await store.healthCheck(); return { ok: health.ok, provider: "notion", scaffold: false, health };
+}
+
+export async function main(): Promise<void> {
   const a = process.argv.slice(2);
   const get = (f: string): string | undefined => {
     const i = a.indexOf(f);
@@ -41,10 +49,17 @@ function main(): void {
   const skillRoot = get("--skill-root") || join(import.meta.dir, "..");
   const apply = a.includes("--apply");
   const allowDev = a.includes("--allow-dev");
+  const storage = resolveStorageConfig();
 
   if (detectDevTree(configRoot) && !allowDev) {
     console.log(JSON.stringify({ ok: false, refused: "dev-tree", detail: `${configRoot} is a source tree — refusing to scaffold.` }, null, 2));
     process.exit(2);
+  }
+
+  const storageValidation = await validateSetupStorage(storage, createLifeOSStore(storage));
+  if (!storageValidation.scaffold) {
+    console.log(JSON.stringify({ ...storageValidation, scaffolded: false }, null, 2));
+    process.exit(storageValidation.ok ? 0 : 1);
   }
 
   const templateUser = join(skillRoot, "install", "USER");
@@ -65,4 +80,4 @@ function main(): void {
   process.exit(failures.length === 0 ? 0 : 1);
 }
 
-main();
+if (import.meta.main) await main();

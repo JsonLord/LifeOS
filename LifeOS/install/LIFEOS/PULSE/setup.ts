@@ -18,6 +18,10 @@ import { join, resolve } from "path"
 import { copyFileSync, existsSync, mkdirSync } from "fs"
 import { PULSE_BASE } from "./endpoint"
 import { homedir } from "node:os";
+import { resolveStorageConfig } from "../STORAGE/StorageConfig.ts";
+import { createLifeOSStore } from "../STORAGE/StoreFactory.ts";
+import { validateStorageMappings } from "../STORAGE/CanonicalState.ts";
+import type { LifeOSStore } from "../STORAGE/types.ts";
 
 const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir()
 const LIFEOS_DIR = join(HOME, ".claude", "LIFEOS")
@@ -100,8 +104,19 @@ export async function writeConfigPreserving(
 
 // ── Step 1: Read Identity ──
 
-async function readIdentity(): Promise<{ name: string; description: string }> {
+export async function readIdentity(store?: LifeOSStore): Promise<{ name: string; description: string }> {
   heading("Step 1: Worker Identity")
+
+  // PROVIDER_NEUTRAL_BEGIN
+  if (store && store.provider !== "filesystem") {
+    const content = (await store.getDocument("da_identity"))?.content ?? ""
+    const nameMatch = content.match(/\*\*Name:\*\*\s*(.+)/i) ?? content.match(/^-\s*\*\*Name:\*\*\s*(.+)/mi)
+    const roleMatch = content.match(/\*\*Role:\*\*\s*(.+)/i)
+    const name = nameMatch?.[1]?.trim() ?? ""; const description = roleMatch?.[1]?.trim() ?? ""
+    if (!name) throw new Error("Notion mapping da_identity is readable but has no **Name:** field")
+    ok(`Found provider identity: ${name}`); return { name: name.toLowerCase(), description }
+  }
+  // PROVIDER_NEUTRAL_END
 
   // DIGITAL_ASSISTANT/ is the real home (public issue #1504, @tzioup — the old
   // flat USER/ path silently missed the identity file and fell back to defaults).
@@ -383,7 +398,12 @@ ${"═".repeat(50)}`)
     warn("Each one is copied to <file>.backup-<timestamp> before it is touched.")
   }
 
-  const identity = await readIdentity()
+  const storage = resolveStorageConfig(); const store = createLifeOSStore(storage)
+  if (storage.provider !== "filesystem") {
+    const health = await store.healthCheck(); if (!health.ok) throw new Error(`Storage health failed: ${health.message}`)
+    const mapping = await validateStorageMappings(storage, store); if (!mapping.ok) throw new Error(`Storage mapping validation failed: ${mapping.resources.filter((resource) => resource.status !== "ok").map((resource) => `${resource.key}:${resource.status}`).join(", ")}`)
+  }
+  const identity = await readIdentity(store)
 
   const specInput = await prompt("Specialization labels (comma-separated, e.g., research,content — or Enter for none):")
   const specialization = specInput ? specInput.split(",").map((s) => s.trim()).filter(Boolean) : []

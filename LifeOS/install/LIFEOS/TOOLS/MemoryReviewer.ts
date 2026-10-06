@@ -42,17 +42,15 @@ import {
 import { basename as pathBasename, dirname, join as pathJoin, resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
 
-import { add as memoryAdd, sanitizeTypedItemForPersistence, type AddResult } from "./MemorySystem";
+import { add as memoryAdd, addCanonical, sanitizeTypedItemForPersistence, type AddResult } from "./MemorySystem";
+import { createLifeOSStore } from "../STORAGE/StoreFactory.ts";
+import type { LifeOSStore } from "../STORAGE/types.ts";
+import { parseMemoryContent } from "./MemoryWriter";
 import { read as memoryWriterRead } from "./MemoryWriter";
-import { isKnownType, inferProposalKind, pinProposalTargetFile, type TypedItem } from "./MemoryTypes";
+import { isKnownType, type TypedItem } from "./MemoryTypes";
 import { inference } from "./Inference";
 import { getPrincipalName, getDAName } from "../../hooks/lib/identity";
 import { ingestCaptureEnvelope, stripPrivateContent, type CaptureEnvelope } from "./CaptureEnvelope";
-import {
-  applyProposalEdit,
-  markProposal,
-  logProposalEvent,
-} from "../PULSE/lib/memory-proposals";
 
 // ── Constants ──
 
@@ -60,7 +58,6 @@ const CLAUDE_ROOT = pathResolve(homedir(), ".claude");
 const HARNESS_PROJECTS_DIR = pathResolve(homedir(), ".claude", "projects");
 const RUNS_LOG_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/reviewer-runs.jsonl");
 const RUNS_DEBUG_DIR = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/reviewer-runs");
-const REVIEW_CONFIG_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/CONFIG/memory-review.json");
 
 const DEFAULT_TURNS = 20;
 // Curation is heavier than the old additive capture — the reviewer now reads
@@ -70,19 +67,6 @@ const DEFAULT_TURNS = 20;
 // (Honcho: "waking capture" is cheap, "dreaming consolidation" is slow) made
 // concrete without a second subprocess.
 const DEFAULT_TIMEOUT_MS = 240_000; // 120s timed out repeatedly on heavy sessions (2026-08-03); successful runs measure 50–115s, so 240s bounds the tail without masking hangs
-const DEFAULT_CONFIDENCE_THRESHOLD = 0.70;
-
-function loadConfidenceThreshold(): number {
-  // ISC-68 / ISC-157: high-confidence proposals auto-apply alongside enqueue.
-  // Threshold lives in USER/CONFIG/memory-review.json. Falls back to 0.70.
-  try {
-    if (!existsSync(REVIEW_CONFIG_PATH)) return DEFAULT_CONFIDENCE_THRESHOLD;
-    const raw = JSON.parse(readFileSync(REVIEW_CONFIG_PATH, "utf8")) as { confidence_threshold?: number };
-    return typeof raw.confidence_threshold === "number" ? raw.confidence_threshold : DEFAULT_CONFIDENCE_THRESHOLD;
-  } catch {
-    return DEFAULT_CONFIDENCE_THRESHOLD;
-  }
-}
 
 // ── Conversation extraction ──
 
@@ -328,16 +312,10 @@ export interface CurrentMemorySnapshot {
   assistant: string[];
 }
 
-const PRINCIPAL_MEMORY_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_MEMORY.md");
-const DA_MEMORY_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/DIGITAL_ASSISTANT/DA_MEMORY.md");
-
 /** Read both hot-layer files' current entries so the reviewer curates against reality. */
-export function readCurrentMemorySnapshot(): CurrentMemorySnapshot {
-  const readEntries = (path: string): string[] => {
-    const r = memoryWriterRead(path);
-    return "code" in r ? [] : r.entries;
-  };
-  return { principal: readEntries(PRINCIPAL_MEMORY_PATH), assistant: readEntries(DA_MEMORY_PATH) };
+export async function readCurrentMemorySnapshot(store: LifeOSStore = createLifeOSStore()): Promise<CurrentMemorySnapshot> {
+  const [principal, assistant] = await Promise.all([store.getDocument("principal_memory"), store.getDocument("da_memory")]);
+  return { principal: parseMemoryContent(principal?.content ?? "").entries, assistant: parseMemoryContent(assistant?.content ?? "").entries };
 }
 
 function renderCurrentMemory(snap: CurrentMemorySnapshot | undefined): string[] {
@@ -496,7 +474,7 @@ function isGuardRefusal(result: AddResult): boolean {
   return !result.ok && /ESUSPECT_EROSION/.test((result as { message?: string }).message ?? "");
 }
 
-export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; confidenceThreshold?: number } = {}): { summary: DispatchSummary; results: AddResult[] } {
+export async function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; confidenceThreshold?: number; store?: LifeOSStore } = {}): Promise<{ summary: DispatchSummary; results: AddResult[] }> {
   const summary: DispatchSummary = {
     total: items.length,
     by_type: {},
@@ -509,7 +487,6 @@ export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; conf
     proposals_auto_apply_failed: 0,
   };
   const results: AddResult[] = [];
-  const threshold = opts.confidenceThreshold ?? loadConfidenceThreshold();
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -521,58 +498,13 @@ export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; conf
       continue;
     }
 
-    const result = memoryAdd(item);
+    const result = item.type === "proposal" ? memoryAdd(item) : await addCanonical(item, opts.store ?? createLifeOSStore());
     results.push(result);
     if (result.ok) {
       summary.succeeded++;
 
-      // ISC-68 / ISC-157: direct-apply branch for high-confidence proposals.
-      // The enqueue already landed via MemorySystem.add → pending-proposals.jsonl.
-      // For proposals at or above the threshold, ALSO apply the edit to the
-      // Tier C target file and transition status pending → auto-applied.
-      // This is the orchestrator that was deferred from MemorySystem.add (which
-      // is a pure TS module and cannot reach into Claude-side skills).
-      if (item.type === "proposal" && typeof item.confidence === "number" && item.confidence >= threshold) {
-        const proposalId = (result.detail?.id as string | undefined) ?? null;
-        // Pin the APPLY target the same way the queue write already does
-        // (public PR #1563, @anikinsasha). Without this, the queue row recorded
-        // the canonical file while the edit landed on the reviewer's raw path —
-        // divergence, not just a drop (public issue #1611, @xmasyx).
-        const pinnedTarget = pinProposalTargetFile(
-          item.target_kind ?? inferProposalKind(item.target_file),
-          item.target_file,
-        );
-        const applied = pinnedTarget === null
-          ? { ok: false as const, reason: `target_file '${item.target_file}' is not an allowed target for its kind` }
-          : applyProposalEdit(pinnedTarget, item.edit);
-        if (applied.ok && proposalId) {
-          markProposal(proposalId, {
-            status: "auto-applied",
-            resolved_at: new Date().toISOString(),
-            applied_edit: item.edit,
-          });
-          logProposalEvent({
-            id: proposalId,
-            file: item.target_file,
-            edit: item.edit,
-            confidence: item.confidence,
-            status: "auto-applied",
-            threshold,
-          });
-          summary.proposals_auto_applied++;
-        } else {
-          logProposalEvent({
-            id: proposalId,
-            file: item.target_file,
-            edit: item.edit,
-            confidence: item.confidence,
-            status: "auto-apply-failed",
-            reason: applied.ok ? "missing-id" : applied.reason,
-            threshold,
-          });
-          summary.proposals_auto_apply_failed++;
-        }
-      }
+      // Proposals remain local operational review state. They are never
+      // auto-applied to canonical state; approval uses the shared coach flow.
     } else if (isGuardRefusal(result)) {
       // A safety-guard refusal (ESUSPECT_EROSION — the MemoryWriter blocking a net-drop
       // consolidation) is the guard working, not a pipeline failure. Counting it as `failed`
@@ -660,7 +592,7 @@ export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
 
   // 3. Build prompt — inject CURRENT memory state so the reviewer curates
   //    against reality (the op:"set" path REPLACES, so it must see what's there).
-  const snapshot = readCurrentMemorySnapshot();
+  const snapshot = await readCurrentMemorySnapshot();
   // Resolve {{PRINCIPAL_NAME}} / {{DA_NAME}} placeholders (present in shipped
   // installs after the release scrubber) to the configured identity before the
   // prompts reach the model. No-op in the live tree.
@@ -731,7 +663,7 @@ export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
   writeRunDebug(runId, { "response.parsed.json": JSON.stringify(parsed.output, null, 2) });
 
   // 6. Dispatch
-  const { summary, results } = dispatchItems(parsed.output.items, { dryRun: opts.dryRun });
+  const { summary, results } = await dispatchItems(parsed.output.items, { dryRun: opts.dryRun });
   writeRunDebug(runId, {
     "dispatch.log": [
       `Items: ${summary.total} (succeeded=${summary.succeeded} failed=${summary.failed} skipped_guard=${summary.skipped_guard})`,
@@ -807,7 +739,7 @@ async function smokeTest(): Promise<number> {
     { type: "memory", actor: "principal", content: "PREFERENCE: smoke dry-run" },
     { type: "idea", title: "Smoke Dry Idea", content: "..." },
   ];
-  const { summary: drySum } = dispatchItems(dryItems, { dryRun: true });
+  const { summary: drySum } = await dispatchItems(dryItems, { dryRun: true });
   check("dispatch: dry-run skips real writes", drySum.succeeded === 2 && drySum.failed === 0);
   check("dispatch: by-type tally correct", drySum.by_type.memory === 1 && drySum.by_type.idea === 1);
 

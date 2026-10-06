@@ -32,6 +32,9 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync, readdirSync, m
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
+import { createLifeOSStore } from "../STORAGE/StoreFactory.ts";
+import { resolveStorageConfig } from "../STORAGE/StorageConfig.ts";
+import type { LifeOSStore } from "../STORAGE/types.ts";
 
 const HOME = process.env.HOME || homedir();
 const CLAUDE = join(HOME, ".claude");
@@ -188,11 +191,20 @@ export function extractTokens(text: string, opts: { singles?: boolean } = {}): S
   return out;
 }
 
-function main(): void {
+export async function providerCanonicalDenyCorpus(store: LifeOSStore): Promise<string[]> {
+  const [identity, telos, contacts] = await Promise.all([
+    store.getDocument("principal_identity"), store.getDocument("principal_telos"), store.queryCollection("contacts", { limit: 100, hydrateContent: true }),
+  ]);
+  return [identity?.content, telos?.content, ...contacts.flatMap((record) => [record.title, record.content])].filter((value): value is string => Boolean(value));
+}
+
+async function main(): Promise<void> {
   const dryRun = process.argv.includes("--dry-run");
   const showTokens = process.argv.includes("--show-tokens");
-  const files = corpusFiles();
+  const providerMode = process.argv.includes("--provider-store");
+  const files = corpusFiles().filter((path) => !providerMode || path.includes("/MEMORY/_NETWORK/"));
   const tokens = new Set<string>();
+  if (providerMode) for (const text of await providerCanonicalDenyCorpus(createLifeOSStore(resolveStorageConfig()))) for (const token of extractTokens(text)) tokens.add(token);
   for (const f of files) {
     // Single-token extraction stays OFF: even network sources are prose-heavy and
     // yield generic tech words that false-positive. Name 2-grams + emails + domains
@@ -200,7 +212,7 @@ function main(): void {
     try { for (const t of extractTokens(readFileSync(f, "utf8"))) tokens.add(t); }
     catch { /* skip unreadable */ }
   }
-  console.log(`[DeriveDenyHashes] ${files.length} corpus files -> ${tokens.size} distinctive tokens`);
+  console.log(`[DeriveDenyHashes] ${providerMode ? "provider canonical corpus + " : ""}${files.length} local operational corpus files -> ${tokens.size} distinctive tokens`);
   if (showTokens) {
     console.log("[DeriveDenyHashes] --show-tokens (LOCAL review, NOT written to disk):");
     console.log([...tokens].sort().join(", "));
@@ -237,4 +249,4 @@ function main(): void {
   console.log(`[DeriveDenyHashes] wrote ${hashes.length} salted hashes -> ${OUT_PATH} (no plaintext)`);
 }
 
-if (import.meta.main) main();
+if (import.meta.main) await main();

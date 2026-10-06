@@ -5,27 +5,28 @@
  *
  * Route: GET /api/projects → { count, source, generatedAt, projects, groups }
  *   - Top-level count/source/projects mirror the "live" group (back-compat).
- *   - groups: one entry per source — live apps (PROJECTS.md), TELOS projects
- *     (TELOS.md ## Projects), retired (PROJECTS_RETIRED.md).
+ *   - groups: canonical live projects plus provider-supported projections.
  *
  * Data/code separation: no project name, path, URL, or stack is hardcoded here.
  * Every field is derived from the markdown at request time.
  */
+import { createLifeOSStore } from "../../STORAGE/StoreFactory.ts";
+import { getProjects } from "../../STORAGE/CanonicalState.ts";
+import type { LifeOSStore } from "../../STORAGE/types.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const MODULE_NAME = "projects";
+// FILESYSTEM_COMPAT_BEGIN — default-provider legacy project projections.
 const USER_DIR = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "LIFEOS", "USER");
-const PROJECTS_PATH = join(USER_DIR, "PROJECTS.md");
-
-/** Every project source Pulse knows about — one tab each on the dashboard. */
-const SOURCES: { key: string; label: string; path: string; source: string; kind: "table" | "telos" }[] = [
-  { key: "live", label: "Live Apps", path: PROJECTS_PATH, source: "USER/PROJECTS.md", kind: "table" },
-  { key: "telos", label: "TELOS", path: join(USER_DIR, "TELOS", "TELOS.md"), source: "USER/TELOS/TELOS.md § Projects", kind: "telos" },
-  { key: "retired", label: "Retired", path: join(USER_DIR, "PROJECTS_RETIRED.md"), source: "USER/PROJECTS_RETIRED.md", kind: "table" },
+const SOURCES = [
+  { key: "live", label: "Live Apps", path: join(USER_DIR, "PROJECTS.md"), source: "USER/PROJECTS.md", kind: "table" as const },
+  { key: "telos", label: "TELOS", path: join(USER_DIR, "TELOS", "TELOS.md"), source: "USER/TELOS/TELOS.md § Projects", kind: "telos" as const },
+  { key: "retired", label: "Retired", path: join(USER_DIR, "PROJECTS_RETIRED.md"), source: "USER/PROJECTS_RETIRED.md", kind: "table" as const },
 ];
-const state = { running: false };
+// FILESYSTEM_COMPAT_END
+const state = { running: false, lastError: null as string | null, count: 0 };
 
 export type Badge =
   | "system-of-record"
@@ -183,7 +184,7 @@ export function parseProjects(md: string): Project[] {
 }
 
 /**
- * Parse the `## Projects` section of TELOS.md — prose lines (optionally bulleted),
+ * Parse the legacy filesystem TELOS project section — prose lines (optionally bulleted),
  * one project per non-empty line. These carry no path/URL/deploy; the whole line
  * is the project statement.
  */
@@ -236,41 +237,33 @@ interface ReadResult {
 }
 
 /** Parse one source file into its group. Fail-soft: never throws. */
-function readGroup(src: (typeof SOURCES)[number]): Group {
-  const base = { key: src.key, label: src.label, source: src.source };
-  try {
-    if (!existsSync(src.path)) return { ...base, count: 0, projects: [], error: `${src.source} not found` };
-    const md = readFileSync(src.path, "utf8");
-    const projects = src.kind === "telos" ? parseTelosProjects(md) : parseProjects(md);
-    const group: Group = { ...base, count: projects.length, projects };
-    // Drift signal: file has content but nothing parsed → heading/format changed.
-    if (projects.length === 0 && md.trim().length > 0) {
-      group.error = `${src.source} present but no projects parsed — source format drifted`;
-      console.warn(`[${MODULE_NAME}] ${group.error}`);
-    }
-    return group;
-  } catch (err) {
-    console.warn(`[${MODULE_NAME}] failed to read/parse ${src.source}: ${String(err)}`);
-    return { ...base, count: 0, projects: [], error: String(err) };
-  }
-}
-
 /**
- * Read + parse every source. Fail-soft per group; top-level fields mirror the
- * "live" group so pre-groups consumers keep working.
+ * Read canonical projects through LifeOSStore. Operational module health stays
+ * local; provider failure never falls back to a stale USER file.
  */
-function read(): ReadResult {
+export async function readProjects(store: LifeOSStore = createLifeOSStore()): Promise<ReadResult> {
   const generatedAt = new Date().toISOString();
-  const groups = SOURCES.map(readGroup);
-  const live = groups.find((g) => g.key === "live") ?? groups[0];
-  return {
-    count: live.count,
-    source: live.source,
-    generatedAt,
-    projects: live.projects,
-    groups,
-    ...(live.error ? { error: live.error } : {}),
-  };
+  try {
+    if (store.provider === "filesystem") {
+      // FILESYSTEM_COMPAT_BEGIN — preserves the three existing filesystem groups.
+      const groups = SOURCES.map((source): Group => { if (!existsSync(source.path)) return { key: source.key, label: source.label, source: source.source, count: 0, projects: [], error: `${source.source} not found` }; const content = readFileSync(source.path, "utf8"); const projects = source.kind === "telos" ? parseTelosProjects(content) : parseProjects(content); return { key: source.key, label: source.label, source: source.source, count: projects.length, projects, ...(projects.length === 0 && content.trim() ? { error: `${source.source} present but no projects parsed — source format drifted` } : {}) }; });
+      const live = groups[0]; state.count = live.count; state.lastError = live.error ?? null; return { count: live.count, source: live.source, generatedAt, projects: live.projects, groups, ...(live.error ? { error: live.error } : {}) };
+      // FILESYSTEM_COMPAT_END
+    }
+    const records = await getProjects(store, 25); const projects = records.flatMap((record) => {
+      const parsed = parseProjects(record.content ?? "");
+      if (parsed.length) return parsed;
+      if (!record.title) return [];
+      return [{ name: record.title, rawName: record.title, path: "", url: "", href: null, deploy: "", stack: "", badges: [] as Badge[], openSession: false }];
+    });
+    const group: Group = { key: "live", label: "Live Apps", source: `${store.provider}:projects`, count: projects.length, projects };
+    state.count = projects.length; state.lastError = null;
+    const unsupported = (key: string, label: string): Group => ({ key, label, source: "unsupported:notion-projection", count: 0, projects: [], error: `${label} is not represented reliably by the canonical projects collection` });
+    return { count: projects.length, source: group.source, generatedAt, projects, groups: [group, unsupported("telos", "TELOS"), unsupported("retired", "Retired")] };
+  } catch (error) {
+    state.lastError = error instanceof Error ? error.message : String(error);
+    throw error;
+  }
 }
 
 export async function start(): Promise<void> {
@@ -284,23 +277,14 @@ export function health(): { status: string; details?: Record<string, unknown> } 
   if (!state.running) return { status: "stopped" };
   // Parse-drift is DEGRADED, not healthy-with-zero: a renamed column once zeroed
   // the page for a week while health stayed green (2026-07-19 incident).
-  let counts: Record<string, number> = {};
-  let drift: string[] = [];
-  try {
-    const r = read();
-    counts = Object.fromEntries(r.groups.map((g) => [g.key, g.count]));
-    drift = r.groups.filter((g) => g.error).map((g) => g.error!);
-  } catch {
-    /* ignore */
-  }
   return {
-    status: drift.length > 0 ? "degraded" : "healthy",
-    details: { ...counts, ...(drift.length ? { drift } : {}) },
+    status: state.lastError ? "degraded" : "healthy",
+    details: { live: state.count, ...(state.lastError ? { error: state.lastError } : {}) },
   };
 }
 export async function handleRequest(_req: Request, pathname: string): Promise<Response | null> {
   const sub = pathname.replace(/^\/api\/projects/, "") || "/";
-  if (sub === "/" || sub === "/list") return Response.json(read());
+  if (sub === "/" || sub === "/list") return Response.json(await readProjects());
   if (sub === "/status" || sub === "/health") return Response.json(health());
   return null;
 }

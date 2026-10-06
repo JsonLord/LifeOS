@@ -18,6 +18,10 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { canonicalInputHashes } from "../STORAGE/CanonicalState.ts";
+import { createLifeOSStore } from "../STORAGE/StoreFactory.ts";
+import { resolveStorageConfig } from "../STORAGE/StorageConfig.ts";
+import type { LifeOSStore } from "../STORAGE/types.ts";
 
 type SpawnReadable = ReadableStream<Uint8Array> | null;
 type SpawnProcess = {
@@ -171,6 +175,10 @@ function currentHashes(paths: string[]): Record<string, string> {
   return hashes;
 }
 
+export async function getDerivedCanonicalHashes(store: LifeOSStore): Promise<Record<string, string>> {
+  return canonicalInputHashes(store);
+}
+
 function readState(): StateFile | null {
   if (!existsSync(STATE_PATH)) return null;
   const raw = readFileSync(STATE_PATH, "utf-8");
@@ -206,6 +214,7 @@ function isStateSource(path: string): boolean {
 function isDenyCorpusSource(path: string): boolean {
   return /\/(PRINCIPAL_IDENTITY|RESUME|CONTACTS|GEAR)\.md$/.test(path)
     || /\/TELOS\/TELOS\.md$/.test(path)
+    || ["document:principal_identity", "document:principal_telos", "collection:contacts"].includes(path)
     || path.includes("/MEMORY/_NETWORK/");
 }
 
@@ -229,12 +238,12 @@ function pageIds(): string[] {
   return ids;
 }
 
-function plannedActions(changed: string[]): PlannedAction[] {
+export function plannedActions(changed: string[], provider: LifeOSStore["provider"] = "filesystem"): PlannedAction[] {
   const actions: PlannedAction[] = [];
   const telosSources = changed.filter(isTelosSource);
   const stateSources = changed.filter(isStateSource);
 
-  if (telosSources.length > 0) {
+  if (provider === "filesystem" && telosSources.length > 0) {
     actions.push({
       kind: "telos-summary",
       cmd: ["bun", join(TOOLS_DIR, "GenerateTelosSummary.ts")],
@@ -243,7 +252,7 @@ function plannedActions(changed: string[]): PlannedAction[] {
     });
   }
 
-  if (stateSources.length > 0) {
+  if (provider === "filesystem" && stateSources.length > 0) {
     actions.push({
       kind: "pai-state",
       cmd: ["bun", join(TOOLS_DIR, "UpdateLifeosState.ts")],
@@ -256,13 +265,13 @@ function plannedActions(changed: string[]): PlannedAction[] {
   if (denyCorpus.length > 0) {
     actions.push({
       kind: "deny-hashes",
-      cmd: ["bun", join(TOOLS_DIR, "DeriveDenyHashes.ts")],
+      cmd: ["bun", join(TOOLS_DIR, "DeriveDenyHashes.ts"), ...(provider === "filesystem" ? [] : ["--provider-store"])],
       timeoutMs: DEFAULT_TIMEOUT_MS,
       triggeredBy: denyCorpus,
     });
   }
 
-  if (changed.length > 0) {
+  if (provider === "filesystem" && changed.length > 0) {
     for (const id of pageIds()) {
       actions.push({
         kind: "data-plane-page",
@@ -383,12 +392,13 @@ function printStatus(): void {
   }
 }
 
-async function runSync(dryRun: boolean, force: boolean): Promise<number> {
-  const state = readState();
-  const watched = watchedSourceFiles();
-  const hashes = currentHashes(watched);
+export async function runSync(dryRun: boolean, force: boolean, store = createLifeOSStore(resolveStorageConfig()), persistence = { readState, writeState, appendLog }): Promise<number> {
+  const state = persistence.readState();
+  const providerHashes = store.provider === "filesystem" ? null : await getDerivedCanonicalHashes(store);
+  const watched = providerHashes ? Object.keys(providerHashes).sort() : watchedSourceFiles();
+  const hashes = providerHashes ?? currentHashes(watched);
   const changed = changedFiles(state, hashes, force);
-  const actions = plannedActions(changed);
+  const actions = plannedActions(changed, store.provider);
 
   if (dryRun) {
     printDryRun(changed, actions);
@@ -442,8 +452,8 @@ async function runSync(dryRun: boolean, force: boolean): Promise<number> {
   }
 
   const lastRun = new Date().toISOString();
-  writeState({ fileHashes: nextHashes, lastRun });
-  appendLog({ ts: lastRun, changed, actions: actionLogs, dryRun: false });
+  persistence.writeState({ fileHashes: nextHashes, lastRun });
+  persistence.appendLog({ ts: lastRun, changed, actions: actionLogs, dryRun: false });
   return hadFailure ? 1 : 0;
 }
 
@@ -484,4 +494,4 @@ async function main(): Promise<void> {
   process.exit(exitCode);
 }
 
-main();
+if (import.meta.main) await main();
