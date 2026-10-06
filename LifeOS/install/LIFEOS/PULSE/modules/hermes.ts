@@ -22,9 +22,9 @@
  *   - `code`    — `LIFEOS/HERMES/*`. Ships publicly, install-generic. Writes are
  *                 gated on `assertClean()`, so a home path or a credential typed
  *                 into the editor is refused rather than committed.
- *   - `source`  — `LIFEOS/USER/*` plus the system prompt. The principal's real
- *                 content, and the actual input to SOUL.md. Editing here is what
- *                 changes what the sidecar is.
+ *   - `source`  — canonical LifeOSStore resources plus the system prompt.
+ *                 Provider-backed personal content is previewed logically and
+ *                 can only be mutated through the trusted LifeOS surface.
  *   - `runtime` — `$HERMES_HOME`. Outside the LifeOS repo entirely. Some of it is
  *                 generated (SOUL.md, policy.json, the installed plugin copies)
  *                 and therefore read-only here: a hand edit survives exactly until
@@ -42,6 +42,9 @@ import { basename, join } from "node:path";
 import { checkHermesHealth, type HermesHealth } from "../../HERMES/Health.ts";
 import { analyzeGuardLog } from "../../HERMES/LogAnalysis.ts";
 import { assertClean, scrubPaths } from "../../HERMES/RenderSoul.ts";
+import { createLifeOSStore } from "../../STORAGE/StoreFactory.ts";
+import { resolveStorageConfig } from "../../STORAGE/StorageConfig.ts";
+import type { LifeOSCollectionKey, LifeOSDocumentKey, LifeOSStore } from "../../STORAGE/types.ts";
 
 const MODULE_NAME = "hermes";
 const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
@@ -72,6 +75,7 @@ interface CoreFile {
   sourceIds?: string[];
   /** Credential material. Listed, never read. */
   sealed?: boolean;
+  canonical?: { type: "document"; key: LifeOSDocumentKey } | { type: "collection"; key: LifeOSCollectionKey };
 }
 
 /**
@@ -157,6 +161,7 @@ const CORE_FILES: readonly CoreFile[] = [
   },
 
   // ── source: what SOUL.md is rendered FROM ──
+  // FILESYSTEM_COMPAT_BEGIN — paths are used only for filesystem-mode editing.
   {
     id: "system-prompt",
     label: "LIFEOS_SYSTEM_PROMPT.md",
@@ -172,6 +177,7 @@ const CORE_FILES: readonly CoreFile[] = [
     path: join(USER_DIR, "DIGITAL_ASSISTANT", "DA_IDENTITY.md"),
     language: "markdown",
     role: "Who the assistant is. Personality, writing style, and the relationship sections all reach the sidecar.",
+    canonical: { type: "document", key: "da_identity" },
   },
   {
     id: "da-memory",
@@ -180,6 +186,7 @@ const CORE_FILES: readonly CoreFile[] = [
     path: join(USER_DIR, "DIGITAL_ASSISTANT", "DA_MEMORY.md"),
     language: "markdown",
     role: "Hot-layer memory about the assistant's own operation, budgeted into SOUL.md.",
+    canonical: { type: "document", key: "da_memory" },
   },
   {
     id: "principal-identity",
@@ -188,6 +195,7 @@ const CORE_FILES: readonly CoreFile[] = [
     path: join(USER_DIR, "PRINCIPAL", "PRINCIPAL_IDENTITY.md"),
     language: "markdown",
     role: "Who the principal is. PII lines are dropped at render time, so the sidecar gets the person without the address.",
+    canonical: { type: "document", key: "principal_identity" },
   },
   {
     id: "principal-memory",
@@ -196,6 +204,7 @@ const CORE_FILES: readonly CoreFile[] = [
     path: join(USER_DIR, "PRINCIPAL", "PRINCIPAL_MEMORY.md"),
     language: "markdown",
     role: "Hot-layer memory about the principal, budgeted into SOUL.md.",
+    canonical: { type: "document", key: "principal_memory" },
   },
   {
     id: "telos",
@@ -206,6 +215,7 @@ const CORE_FILES: readonly CoreFile[] = [
     role: "Missions, goals, problems, challenges — what the sidecar understands the principal to be building toward.",
     generatedBy: "LIFEOS/TOOLS/GenerateTelosSummary.ts (from TELOS.md)",
     sourceIds: [],
+    canonical: { type: "document", key: "principal_telos" },
   },
   {
     id: "projects",
@@ -214,11 +224,13 @@ const CORE_FILES: readonly CoreFile[] = [
     path: join(USER_DIR, "PROJECTS.md"),
     language: "markdown",
     role: "The project routing table. Only the names reach SOUL.md, so the sidecar recognises them without carrying paths.",
+    canonical: { type: "collection", key: "projects" },
   },
 
   // ── code: install-generic, ships publicly ──
   {
     id: "render-soul",
+    // FILESYSTEM_COMPAT_END
     label: "RenderSoul.ts",
     plane: "code",
     path: join(HERMES_DIR, "RenderSoul.ts"),
@@ -361,6 +373,21 @@ function describe(f: CoreFile): FileEntry {
   };
 }
 
+async function describeEntry(f: CoreFile, store: LifeOSStore): Promise<FileEntry> {
+  if (!f.canonical) return describe(f);
+  const revision = f.canonical.type === "document" ? await store.getDocumentRevision(f.canonical.key) : await store.getCollectionRevision(f.canonical.key);
+  let content = "";
+  if (f.canonical.type === "document") content = (await store.getDocument(f.canonical.key))?.content ?? "";
+  else content = (await store.queryCollection(f.canonical.key, { limit: 25, hydrateContent: true })).map((record) => record.content ?? record.title ?? "").join("\n\n");
+  return { id: f.id, label: f.canonical.key, plane: f.plane, language: f.language, role: f.role, displayPath: `${f.canonical.type}:${f.canonical.key}`, exists: revision !== null, sealed: false, editable: store.provider === "filesystem" && !f.generatedBy, generatedBy: f.generatedBy ?? null, sourceIds: f.sourceIds ?? [], bytes: Buffer.byteLength(content), lines: content ? content.split("\n").length : 0, modified: revision?.updatedAt ?? null };
+}
+
+async function canonicalContent(f: CoreFile, store: LifeOSStore): Promise<string> {
+  if (!f.canonical) throw new Error("not canonical");
+  if (f.canonical.type === "document") return (await store.getDocument(f.canonical.key))?.content ?? "";
+  return (await store.queryCollection(f.canonical.key, { limit: 25, hydrateContent: true })).map((record) => record.content ?? record.title ?? "").join("\n\n");
+}
+
 // ── mount drift ──
 
 /** Run a Hermes tool and capture its result. Fixed argv — nothing user-supplied. */
@@ -416,8 +443,9 @@ function backup(f: CoreFile): string | null {
 
 // ── routes ──
 
-export async function handleRequest(req: Request, pathname: string): Promise<Response | null> {
+export async function handleRequest(req: Request, pathname: string, storeOverride?: LifeOSStore): Promise<Response | null> {
   const method = req.method;
+  const storage = storeOverride ? null : resolveStorageConfig(); const store = storeOverride ?? createLifeOSStore(storage!);
 
   if (method === "GET" && (pathname === "/api/hermes" || pathname === "/api/hermes/")) {
     let hermes: HermesHealth | null = null;
@@ -430,7 +458,7 @@ export async function handleRequest(req: Request, pathname: string): Promise<Res
       health: hermes,
       hermesHome: scrubPaths(HERMES_HOME),
       mount: await mountDrift(),
-      files: CORE_FILES.map(describe),
+      files: await Promise.all(CORE_FILES.map((file) => describeEntry(file, store))),
       planes: {
         runtime: "The mounted install, outside the LifeOS repo. Generated files are read-only here.",
         source: "Your content. This is what SOUL.md is rendered from — editing here changes what the sidecar is.",
@@ -469,6 +497,7 @@ export async function handleRequest(req: Request, pathname: string): Promise<Res
           { status: 403 },
         );
       }
+      if (f.canonical) { const content = await canonicalContent(f, store); return Response.json({ meta: await describeEntry(f, store), content }); }
       if (!existsSync(f.path)) return Response.json({ error: "not found on disk", meta: describe(f) }, { status: 404 });
       const st = statSync(f.path);
       if (st.size > MAX_SERVE_BYTES) {
@@ -478,6 +507,7 @@ export async function handleRequest(req: Request, pathname: string): Promise<Res
     }
 
     if (method === "PUT") {
+      if (f.canonical && store.provider !== "filesystem") return Response.json({ error: "provider-managed canonical state", detail: "Use the trusted LifeOS mutation and approval commands; filesystem editing is disabled for this provider." }, { status: 409 });
       if (f.sealed) return Response.json({ error: "sealed — not writable from the dashboard" }, { status: 403 });
       if (f.generatedBy) {
         return Response.json(

@@ -70,6 +70,7 @@ export const CONTACTS_PATH = pathJoin(LIFEOS_DIR, "USER", "CONTACTS.md");
 // ── Types ──
 
 export type MemoryTypeName = "memory" | "idea" | "knowledge" | "proposal";
+export type CanonicalMemoryResource = "principal_memory" | "da_memory" | "ideas" | "knowledge";
 export type Tier = "A" | "B" | "C";
 export type LoadTiming = "always" | "on-relevance" | "surface-only";
 export type WriteMode = "set-overwrite" | "append" | "queue";
@@ -158,6 +159,14 @@ export interface KnowledgeItem {
    * deduplicates by slug.
    */
   related?: RelatedLink[];
+}
+
+/** Provider-neutral destination; proposal is intentionally operational/local. */
+export function canonicalResourceForItem(item: TypedItem): CanonicalMemoryResource | null {
+  if (item.type === "memory") return item.actor === "principal" ? "principal_memory" : "da_memory";
+  if (item.type === "idea") return "ideas";
+  if (item.type === "knowledge") return "knowledge";
+  return null;
 }
 
 

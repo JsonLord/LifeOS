@@ -4,6 +4,7 @@ import { atomicWriteText } from "../lib/atomic-write";
 import { parseFrontmatter, serializeFrontmatter } from "../lib/frontmatter";
 import { sha256Hex } from "../lib/cache";
 import { homedir } from "node:os";
+import { resolveStorageConfig } from "../../STORAGE/StorageConfig.ts";
 
 const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
 const USER_ROOT = resolve(HOME, ".claude", "LIFEOS", "USER");
@@ -21,7 +22,7 @@ export interface EditRequest {
 
 export interface EditResult {
   ok: boolean;
-  reason?: "out-of-tree" | "containment" | "conflict" | "unchanged" | "missing" | "noop";
+  reason?: "provider-managed" | "out-of-tree" | "containment" | "conflict" | "unchanged" | "missing" | "noop";
   message?: string;
   beforeHash?: string;
   afterHash?: string;
@@ -47,6 +48,7 @@ function logEdit(entry: Record<string, unknown>): void {
 }
 
 export function applyEdit(req: EditRequest): EditResult {
+  if (resolveStorageConfig().provider !== "filesystem") return { ok: false, reason: "provider-managed", message: "Canonical filesystem editing is disabled for this provider; use the trusted LifeOS mutation and approval commands." };
   const abs = resolve(USER_ROOT, "..", req.sourceFile.replace(/^LifeOS\//, ""));
   const truePath = resolve(abs);
 

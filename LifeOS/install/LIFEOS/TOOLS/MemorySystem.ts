@@ -71,9 +71,11 @@ import {
   type MemoryTypeName,
   type Tier,
   type RelatedLink,
+  canonicalResourceForItem,
 } from "./MemoryTypes";
 
-import { setEntries as memoryWriterSetEntries, read as memoryWriterRead } from "./MemoryWriter";
+import { setEntries as memoryWriterSetEntries, read as memoryWriterRead, parseMemoryContent, setStoreEntries } from "./MemoryWriter";
+import type { LifeOSStore } from "../STORAGE/types.ts";
 import { classifyScope } from "./ProposalScope";
 import { addUpgrade } from "./Upgrades";
 import { getTier } from "./MutationTier";
@@ -871,6 +873,31 @@ export function add(item: TypedItem): AddResult {
       if (!r.ok) return r;
       return { ok: true, type: "proposal", path, detail: { id: r.id, status: "queued" } };
     }
+  }
+}
+
+/**
+ * Provider-backed canonical mutation path. Proposal queues remain on `add()`
+ * because they are ephemeral operational review state, not canonical state.
+ */
+export async function addCanonical(item: TypedItem, store: LifeOSStore): Promise<AddResult> {
+  if (!item || typeof item !== "object" || !isKnownType((item as any).type) || item.type === "proposal") return { ok: false, code: "EINVAL_ITEM", message: "Canonical store accepts memory, idea, or knowledge items" };
+  const sanitized = sanitizeTypedItemForPersistence(item); if (!sanitized.ok) return sanitized; item = sanitized.item;
+  try {
+    if (item.type === "memory") {
+      const key = canonicalResourceForItem(item) as "principal_memory" | "da_memory";
+      const existing = await store.getDocument(key); const current = parseMemoryContent(existing?.content ?? "").entries;
+      const entries = item.op === "set" ? (item.entries ?? []) : [...current, item.content ?? ""];
+      const result = await setStoreEntries(store, key, entries);
+      if (!result.ok) return { ok: false, code: "EWRITE_FAILED", message: result.message, underlying: result };
+      return { ok: true, type: "memory", path: `store:${key}`, detail: result };
+    }
+    const collection = canonicalResourceForItem(item) as "ideas" | "knowledge";
+    const title = item.type === "idea" ? item.title : item.name;
+    const record = await store.createRecord(collection, { title, content: item.content, properties: { type: item.type, ...(item.type === "knowledge" ? { entity_type: item.entity_type } : {}), source_session: item.source_session ?? null, confidence: item.confidence ?? null, related: item.related ?? [] } });
+    return { ok: true, type: item.type, path: `store:${collection}/${record.id}`, detail: { id: record.id } };
+  } catch (error) {
+    return { ok: false, code: "EWRITE_FAILED", message: `Canonical store write failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
