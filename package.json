@@ -1,0 +1,21 @@
+{
+  "name": "lifeos",
+  "version": "1.0.0",
+  "description": "LifeOS integration layer",
+  "main": "index.js",
+  "scripts": {
+    "setup": "bun run scripts/setup.ts",
+    "doctor": "bun run scripts/doctor.ts",
+    "discover": "bun run scripts/discover.ts",
+    "validate": "bun run scripts/validate.ts",
+    "coach:mount": "bun run scripts/mount.ts",
+    "upgrade": "bun run scripts/upgrade.ts",
+    "rollback": "bun run scripts/rollback.ts",
+    "test": "bun test"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "^1.1.10",
+    "bun-types": "^1.1.29"
+  }
+}
