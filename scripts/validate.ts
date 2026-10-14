@@ -8,14 +8,18 @@ async function main() {
 
   try {
     console.log("Running validation...");
-    // In actual usage this will invoke `lifeos storage validate` logic
-    // we use the actual CLI entrypoint to validate
-    await $`bun ${lifeosCoach} storage validate`;
+    const result = await $`bun ${lifeosCoach} storage validate`;
+
+    if (result.exitCode !== 0) {
+       console.error("Validation failed with non-zero exit code.");
+       process.exit(result.exitCode);
+    }
+
     console.log("Validation complete.");
-  } catch (err) {
-    console.error("Validation failed:", err);
+  } catch (err: any) {
+    console.error("Validation failed:", err.message || err);
     process.exit(1);
   }
 }
 
-main().catch(console.error);
+main();
